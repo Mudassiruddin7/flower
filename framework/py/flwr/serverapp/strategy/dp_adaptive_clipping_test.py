@@ -16,7 +16,7 @@
 
 import math
 from collections.abc import Callable
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -75,10 +75,13 @@ def _reply(update: np.ndarray, norm_bit: int | None = None) -> Mock:
     return reply
 
 
-def _server_side(initial_clipping_norm: float) -> DifferentialPrivacyAdaptiveBase:
+def _server_side(
+    initial_clipping_norm: float, noise_multiplier: float = 0.0
+) -> DifferentialPrivacyAdaptiveBase:
+    # With no noise the clipped-count noise is 0 too, which makes a round deterministic.
     return DifferentialPrivacyServerSideAdaptiveClipping(
         strategy=FedAvg(min_train_nodes=NUM_CLIENTS, min_available_nodes=NUM_CLIENTS),
-        noise_multiplier=0.0,  # also sets the clipped-count noise to 0: deterministic
+        noise_multiplier=noise_multiplier,
         num_sampled_clients=NUM_CLIENTS,
         initial_clipping_norm=initial_clipping_norm,
         target_clipped_quantile=TARGET_QUANTILE,
@@ -86,10 +89,12 @@ def _server_side(initial_clipping_norm: float) -> DifferentialPrivacyAdaptiveBas
     )
 
 
-def _client_side(initial_clipping_norm: float) -> DifferentialPrivacyAdaptiveBase:
+def _client_side(
+    initial_clipping_norm: float, noise_multiplier: float = 0.0
+) -> DifferentialPrivacyAdaptiveBase:
     return DifferentialPrivacyClientSideAdaptiveClipping(
         strategy=FedAvg(min_train_nodes=NUM_CLIENTS, min_available_nodes=NUM_CLIENTS),
-        noise_multiplier=0.0,
+        noise_multiplier=noise_multiplier,
         num_sampled_clients=NUM_CLIENTS,
         initial_clipping_norm=initial_clipping_norm,
         target_clipped_quantile=TARGET_QUANTILE,
@@ -120,6 +125,7 @@ def _run_round(wrapper: DifferentialPrivacyAdaptiveBase, norms: list[float]) -> 
     wrapper.aggregate_train(1, replies)
 
 
+WrapperFactory = Callable[..., DifferentialPrivacyAdaptiveBase]
 WRAPPERS = [
     pytest.param(_server_side, id="server-side"),
     pytest.param(_client_side, id="client-side"),
@@ -128,7 +134,7 @@ WRAPPERS = [
 
 @pytest.mark.parametrize("make_wrapper", WRAPPERS)
 def test_clipping_norm_grows_when_every_update_is_clipped(
-    make_wrapper: Callable[[float], DifferentialPrivacyAdaptiveBase],
+    make_wrapper: WrapperFactory,
 ) -> None:
     """With nothing under the bound the norm must go up, by exp(lr * target)."""
     wrapper = make_wrapper(1.0)
@@ -142,7 +148,7 @@ def test_clipping_norm_grows_when_every_update_is_clipped(
 
 @pytest.mark.parametrize("make_wrapper", WRAPPERS)
 def test_clipping_norm_shrinks_when_no_update_is_clipped(
-    make_wrapper: Callable[[float], DifferentialPrivacyAdaptiveBase],
+    make_wrapper: WrapperFactory,
 ) -> None:
     """With everything under the bound the norm must go down."""
     wrapper = make_wrapper(10.0)
@@ -156,7 +162,7 @@ def test_clipping_norm_shrinks_when_no_update_is_clipped(
 
 @pytest.mark.parametrize("make_wrapper", WRAPPERS)
 def test_clipping_norm_tracks_target_quantile(
-    make_wrapper: Callable[[float], DifferentialPrivacyAdaptiveBase],
+    make_wrapper: WrapperFactory,
 ) -> None:
     """The norm should settle at the target quantile of the update norms."""
     norms = [float(n) for n in np.linspace(1.0, 3.0, NUM_CLIENTS)]
@@ -167,3 +173,24 @@ def test_clipping_norm_tracks_target_quantile(
 
     median = float(np.quantile(norms, TARGET_QUANTILE))
     assert wrapper.clipping_norm == pytest.approx(median, rel=0.1)
+
+
+@pytest.mark.parametrize("make_wrapper", WRAPPERS)
+def test_noise_is_calibrated_to_the_norm_used_for_clipping(
+    make_wrapper: WrapperFactory,
+) -> None:
+    """The norm only changes after the noise, which uses the norm clipped with."""
+    wrapper = make_wrapper(3.0, noise_multiplier=1.0)
+    clipping_norm = wrapper.clipping_norm
+    noise_stdvs: list[float] = []
+
+    with patch(
+        "flwr.serverapp.strategy.dp_adaptive_clipping.add_gaussian_noise_inplace",
+        side_effect=lambda _arrays, stdv: noise_stdvs.append(stdv),
+    ):
+        # Every update is clipped, so the norm for the next round is different.
+        _run_round(wrapper, [10.0] * NUM_CLIENTS)
+
+    assert wrapper.clipping_norm != pytest.approx(clipping_norm)
+    expected = wrapper.noise_multiplier * clipping_norm / NUM_CLIENTS
+    assert noise_stdvs == [pytest.approx(expected)]

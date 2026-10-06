@@ -215,14 +215,16 @@ class DifferentialPrivacyServerSideAdaptiveClipping(DifferentialPrivacyAdaptiveB
         unclipped_fraction = self._noisy_fraction(
             len(replies_list) - clipped_indicator_count, len(replies_list)
         )
-        self._geometric_update(unclipped_fraction)
 
         aggregated_arrays, aggregated_metrics = self.strategy.aggregate_train(
             server_round, replies_list
         )
 
+        # The noise is calibrated to the norm the updates were clipped with, so the
+        # norm for the next round is only updated afterwards.
         if aggregated_arrays:
             aggregated_arrays = self._add_noise_to_aggregated_arrays(aggregated_arrays)
+        self._geometric_update(unclipped_fraction)
 
         return aggregated_arrays, aggregated_metrics
 
@@ -318,10 +320,10 @@ class DifferentialPrivacyClientSideAdaptiveClipping(DifferentialPrivacyAdaptiveB
             server_round, replies_list
         )
 
-        self._update_clip_norm_from_replies(replies_list)
-
+        # The clients clipped with the current norm, so noise first, then update it.
         if aggregated_arrays:
             aggregated_arrays = self._add_noise_to_aggregated_arrays(aggregated_arrays)
+        self._update_clip_norm_from_replies(replies_list)
 
         return aggregated_arrays, aggregated_metrics
 
